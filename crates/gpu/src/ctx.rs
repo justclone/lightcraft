@@ -282,6 +282,7 @@ fn module_source(m: &Module, consts: &str) -> String {
 
 impl Gpu {
     /// Create a device on the best available adapter (no software fallback), or why there is none.
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn new(backends: wgpu::Backends) -> Result<Gpu, String> {
         let mut desc = wgpu::InstanceDescriptor::new_without_display_handle();
         // only these drivers are loaded (`crate::backend`: never Vulkan on Windows unless asked)
@@ -316,6 +317,11 @@ impl Gpu {
             ..Default::default()
         }))
         .map_err(|e| format!("{}: device creation failed ({e})", info.name))?;
+        Self::from_device(device, queue, info, limits)
+    }
+
+    /// Construct Gpu pipelines and buffers from an already-created device and queue.
+    pub fn from_device(device: wgpu::Device, queue: wgpu::Queue, info: wgpu::AdapterInfo, limits: wgpu::Limits) -> Result<Gpu, String> {
         // Errors outside a render's error scopes (see `ErrorScopes`): log, and stop using the GPU.
         device.on_uncaptured_error(std::sync::Arc::new(|e| {
             log::error!("gpu: {e}");
@@ -328,6 +334,7 @@ impl Gpu {
             crate::mark_broken(&format!("device lost ({reason:?}): {msg}"));
         });
         // a kernel the driver's compiler refuses is a validation or an internal error: no GPU, not a half-built one
+        #[cfg(not(target_arch = "wasm32"))]
         let scopes = [device.push_error_scope(wgpu::ErrorFilter::Validation), device.push_error_scope(wgpu::ErrorFilter::Internal)];
         let consts = constants();
         let mut kernels = HashMap::new();
@@ -354,11 +361,14 @@ impl Gpu {
                 kernels.insert(*e, Kernel { pipeline, layout: layout.clone(), nbuf: m.bindings.len() });
             }
         }
-        let [validation, internal] = scopes;
-        let (internal, validation) = (pollster::block_on(internal.pop()), pollster::block_on(validation.pop()));
-        if let Some(e) = internal.or(validation) {
-            log::error!("gpu: kernels failed to build on {}: {e}", info.name);
-            return Err(format!("{}: kernels failed to build ({e})", info.name));
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let [validation, internal] = scopes;
+            let (internal, validation) = (pollster::block_on(internal.pop()), pollster::block_on(validation.pop()));
+            if let Some(e) = internal.or(validation) {
+                log::error!("gpu: kernels failed to build on {}: {e}", info.name);
+                return Err(format!("{}: kernels failed to build ({e})", info.name));
+            }
         }
         let dummy = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("dummy"),
@@ -370,6 +380,7 @@ impl Gpu {
         log::info!("gpu: {} ({:?}), buffers ≤ {} MiB", info.name, info.backend, max_buffer >> 20);
         Ok(Gpu { device, queue, info, kernels, dummy, free: Default::default(), max_buffer })
     }
+
 
     /// A buffer of `len` 32-bit values with undefined contents (a recycled one when possible).
     ///
@@ -560,14 +571,26 @@ impl Gpu {
         };
         // A lost device makes the wait fail and the map callback never run: checking both keeps
         // this from blocking forever (or handing back an unwritten buffer as the image).
-        if let Err(e) = self.device.poll(wgpu::PollType::Wait { submission_index: None, timeout: Some(READBACK_TIMEOUT) }) {
-            return failed(format!("{e}"));
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            if let Err(e) = self.device.poll(wgpu::PollType::Wait { submission_index: None, timeout: Some(READBACK_TIMEOUT) }) {
+                return failed(format!("{e}"));
+            }
+            // another thread's poll may be the one that runs the callback: allow it a moment
+            match rx.recv_timeout(std::time::Duration::from_secs(10)) {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => return failed(format!("{e}")),
+                Err(e) => return failed(format!("map callback: {e}")),
+            }
         }
-        // another thread's poll may be the one that runs the callback: allow it a moment
-        match rx.recv_timeout(std::time::Duration::from_secs(10)) {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => return failed(format!("{e}")),
-            Err(e) => return failed(format!("map callback: {e}")),
+        #[cfg(target_arch = "wasm32")]
+        {
+            let _ = self.device.poll(wgpu::PollType::Poll);
+            match rx.try_recv() {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => return failed(format!("{e}")),
+                Err(_) => return failed("WebGPU readback map pending".into()),
+            }
         }
         let data = match slice.get_mapped_range() {
             Ok(d) => d,
@@ -582,15 +605,18 @@ impl Gpu {
 
 /// Longest wait for a render's GPU work: beyond it the render fails over to the CPU (drivers
 /// normally reset a hung GPU much sooner).
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
 const READBACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// `LIGHTCRAFT_GPU_LIMITS`: lower the device limits, e.g. to reproduce a smaller adapter.
 /// `webgpu` / `downlevel` = 128 MiB storage bindings and 256 MiB buffers (the WebGPU defaults),
 /// `<n>` = n MiB storage bindings and 2n MiB buffers. Returns (binding bytes, buffer bytes).
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
 fn limits_override() -> Option<(u64, u64)> {
     parse_limits(&std::env::var("LIGHTCRAFT_GPU_LIMITS").ok()?)
 }
 
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
 fn parse_limits(v: &str) -> Option<(u64, u64)> {
     let v = v.trim().to_ascii_lowercase();
     match v.as_str() {
@@ -613,6 +639,7 @@ pub(crate) enum FailKind {
     /// A buffer over the device limits: this render only.
     Limit,
     /// The device ran out of memory: this render only (the buffer pool is emptied).
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     OutOfMemory,
     /// The image came back entirely black: redone on the CPU in case the GPU dropped work.
     Blank,
@@ -675,7 +702,7 @@ pub(crate) fn take_failure() -> Option<Failure> {
 /// wgpu error scopes around a render: out-of-memory, validation and internal errors raised by
 /// this thread's calls are captured (instead of reaching the uncaptured-error handler) and fail
 /// the render.
-pub(crate) struct ErrorScopes([wgpu::ErrorScopeGuard; 3]);
+pub(crate) struct ErrorScopes(#[cfg_attr(target_arch = "wasm32", allow(dead_code))] [wgpu::ErrorScopeGuard; 3]);
 
 impl ErrorScopes {
     pub fn push(g: &Gpu) -> ErrorScopes {
@@ -689,15 +716,23 @@ impl ErrorScopes {
     /// Pop the scopes: the most telling error captured (out of memory first — an allocation
     /// failure makes later commands invalid too — then internal, then validation).
     pub fn pop(self) -> Option<Failure> {
-        let [oom, validation, internal] = self.0;
-        // scopes pop in reverse order of their creation
-        let internal = pollster::block_on(internal.pop());
-        let validation = pollster::block_on(validation.pop());
-        let oom = pollster::block_on(oom.pop());
-        if let Some(e) = oom {
-            return Some(Failure { kind: FailKind::OutOfMemory, reason: format!("out of device memory: {e}") });
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let [oom, validation, internal] = self.0;
+            // scopes pop in reverse order of their creation
+            let internal = pollster::block_on(internal.pop());
+            let validation = pollster::block_on(validation.pop());
+            let oom = pollster::block_on(oom.pop());
+            if let Some(e) = oom {
+                return Some(Failure { kind: FailKind::OutOfMemory, reason: format!("out of device memory: {e}") });
+            }
+            internal.or(validation).map(|e| Failure { kind: FailKind::Fatal, reason: format!("device error: {e}") })
         }
-        internal.or(validation).map(|e| Failure { kind: FailKind::Fatal, reason: format!("device error: {e}") })
+        #[cfg(target_arch = "wasm32")]
+        {
+            let _ = self;
+            None
+        }
     }
 }
 

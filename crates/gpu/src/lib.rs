@@ -15,8 +15,8 @@
 //! the same call reporting why *this* render fell back ([`Fallback`]); [`unavailable_reason`] and
 //! [`last_fallback`] (the latest fallback in the process) feed the status displays (`ui.inspect` →
 //! `perf.gpuReason` / `perf.gpuFallback`).
-//! The browser build has no GPU path yet (WebGPU device creation is asynchronous): everything here
-//! compiles to the CPU fallback on wasm32.
+//! The browser build uses WebGPU compute on wasm32 when available (async device creation),
+//! falling back to the CPU pipeline.
 //!
 //! Before the process ends: [`begin_shutdown`], then [`wait_idle`] (issue #620, see `exit.rs`).
 #![forbid(unsafe_code)]
@@ -31,7 +31,6 @@ use lightcraft_raster::Rgb32f;
 
 #[cfg(not(target_arch = "wasm32"))]
 pub mod backend;
-#[cfg(not(target_arch = "wasm32"))]
 mod ctx;
 #[cfg(not(target_arch = "wasm32"))]
 mod exit;
@@ -39,12 +38,9 @@ mod exit;
 pub mod faces;
 #[cfg(all(feature = "denoise", not(target_arch = "wasm32")))]
 pub mod nn;
-#[cfg(not(target_arch = "wasm32"))]
 mod params;
-#[cfg(not(target_arch = "wasm32"))]
 mod render;
 
-#[cfg(not(target_arch = "wasm32"))]
 pub use render::GpuStages;
 
 static ENABLED: AtomicBool = AtomicBool::new(true);
@@ -95,16 +91,21 @@ pub fn unavailable_reason() -> Option<String> {
     if let Some(r) = broken_here() {
         return Some(format!("stopped after a GPU failure: {r}"));
     }
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        match GPU.get() {
-            Some(Err(e)) => Some(e.clone()),
-            _ => None,
+    match GPU.get() {
+        Some(Err(e)) => Some(e.clone()),
+        Some(Ok(_)) => None,
+        None => {
+            #[cfg(target_arch = "wasm32")]
+            {
+                if INIT_STARTED.load(Ordering::Relaxed) {
+                    Some("initializing WebGPU…".into())
+                } else {
+                    Some("WebGPU not initialized yet".into())
+                }
+            }
+            #[cfg(not(target_arch = "wasm32"))]
+            None
         }
-    }
-    #[cfg(target_arch = "wasm32")]
-    {
-        Some("the browser build has no GPU path yet".into())
     }
 }
 
@@ -262,8 +263,10 @@ fn env_disabled() -> bool {
     })
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 static GPU: std::sync::OnceLock<Result<ctx::Gpu, String>> = std::sync::OnceLock::new();
+
+#[cfg(target_arch = "wasm32")]
+static INIT_STARTED: AtomicBool = AtomicBool::new(false);
 
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn device() -> Option<&'static ctx::Gpu> {
@@ -290,14 +293,71 @@ pub(crate) fn device() -> Option<&'static ctx::Gpu> {
     .ok()
 }
 
+#[cfg(target_arch = "wasm32")]
+pub(crate) fn device() -> Option<&'static ctx::Gpu> {
+    if env_disabled() || !ENABLED.load(Ordering::Relaxed) {
+        return existing_device();
+    }
+    warm_up();
+    existing_device()
+}
+
 /// The device if it has been created (never creates it).
-#[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn existing_device() -> Option<&'static ctx::Gpu> {
     GPU.get().and_then(|g| g.as_ref().ok())
 }
 
-/// Create the device and compile the kernels on a background thread now (once the window is up),
-/// so the first render doesn't wait ~0.3–0.4 s for it and the UI thread never does. Does nothing
+#[cfg(target_arch = "wasm32")]
+pub async fn init_async() -> Result<&'static ctx::Gpu, String> {
+    if let Some(r) = GPU.get() {
+        return r.as_ref().map_err(|e| e.clone());
+    }
+    INIT_STARTED.store(true, Ordering::SeqCst);
+    let mut desc = wgpu::InstanceDescriptor::new_without_display_handle();
+    desc.backends = wgpu::Backends::BROWSER_WEBGPU;
+    let instance = wgpu::Instance::new(desc);
+    let adapter = instance
+        .request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::HighPerformance,
+            ..Default::default()
+        })
+        .await
+        .map_err(|e| format!("no WebGPU adapter found in navigator.gpu ({e})"))?;
+
+    let info = adapter.get_info();
+    let limits = adapter.limits();
+    if limits.max_storage_buffers_per_shader_stage < 10 {
+        return Err(format!("{} has too few storage buffers per shader stage ({} < 10)", info.name, limits.max_storage_buffers_per_shader_stage));
+    }
+    let (device, queue) = adapter
+        .request_device(
+            &wgpu::DeviceDescriptor {
+                label: Some("lightcraft-webgpu"),
+                required_limits: limits.clone(),
+                ..Default::default()
+            },
+        )
+        .await
+        .map_err(|e| format!("{}: device creation failed ({e})", info.name))?;
+
+    let gpu = ctx::Gpu::from_device(device, queue, info, limits)?;
+    let _ = GPU.set(Ok(gpu));
+    GPU.get().and_then(|r| r.as_ref().ok()).ok_or_else(|| "failed to retrieve initialized GPU".to_string())
+}
+
+#[cfg(target_arch = "wasm32")]
+pub fn init_from_device(device: wgpu::Device, queue: wgpu::Queue, info: wgpu::AdapterInfo, limits: wgpu::Limits) -> Result<&'static ctx::Gpu, String> {
+    if let Some(r) = GPU.get() {
+        return r.as_ref().map_err(|e| e.clone());
+    }
+    INIT_STARTED.store(true, Ordering::SeqCst);
+    let gpu = ctx::Gpu::from_device(device, queue, info, limits)?;
+    let _ = GPU.set(Ok(gpu));
+    GPU.get().and_then(|r| r.as_ref().ok()).ok_or_else(|| "failed to store initialized GPU".to_string())
+}
+
+/// Create the device and compile the kernels on a background thread/task now (once the window is up),
+/// so the first render doesn't wait for it and the UI thread never does. Does nothing
 /// while GPU rendering is turned off.
 pub fn warm_up() {
     #[cfg(not(target_arch = "wasm32"))]
@@ -306,131 +366,84 @@ pub fn warm_up() {
             let _ = device();
         });
     }
+    #[cfg(target_arch = "wasm32")]
+    if !env_disabled() && ENABLED.load(Ordering::Relaxed) && GPU.get().is_none() {
+        if !INIT_STARTED.swap(true, Ordering::SeqCst) {
+            wasm_bindgen_futures::spawn_local(async {
+                if let Err(e) = init_async().await {
+                    log::warn!("webgpu: init failed, falling back to CPU: {e}");
+                    let _ = GPU.set(Err(e));
+                } else {
+                    log::info!("webgpu: successfully initialized WebGPU device");
+                }
+            });
+        }
+    }
 }
 
 /// Has device creation finished (successfully or not)? Never blocks — for status displays.
 pub fn ready() -> bool {
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        env_disabled() || GPU.get().is_some()
-    }
-    #[cfg(target_arch = "wasm32")]
-    {
-        true
-    }
+    env_disabled() || GPU.get().is_some()
 }
 
 /// Whether a usable GPU adapter exists and GPU rendering is enabled (creates the device on first
 /// use).
 pub fn available() -> bool {
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        enabled() && device().is_some()
-    }
-    #[cfg(target_arch = "wasm32")]
-    {
-        false
-    }
+    enabled() && existing_device().is_some()
 }
 
 /// The adapter's name and backend, e.g. "Apple M4 Pro (Metal)".
 pub fn adapter_name() -> Option<String> {
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        device().map(|g| format!("{} ({:?})", g.info.name, g.info.backend))
-    }
-    #[cfg(target_arch = "wasm32")]
-    {
-        None
-    }
+    existing_device().map(|g| format!("{} ({:?})", g.info.name, g.info.backend))
 }
 
-/// Device buffers held by the renderer.
-#[cfg(not(target_arch = "wasm32"))]
 pub use ctx::GpuMemory;
-
-/// Device buffers held by the renderer.
-#[cfg(target_arch = "wasm32")]
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct GpuMemory {
-    pub allocated: u64,
-    pub pooled: u64,
-    pub retired: u64,
-}
 
 /// Device memory held by the renderer's buffers (zero without a device).
 pub fn memory() -> GpuMemory {
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        ctx::memory()
-    }
-    #[cfg(target_arch = "wasm32")]
-    {
-        GpuMemory::default()
-    }
+    ctx::memory()
 }
 
 /// Keep at most `bytes` of recycled buffers in the free pool from now on (trimming it now).
 pub fn set_pool_limit(bytes: u64) {
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        ctx::POOL_LIMIT.store(bytes, Ordering::Relaxed);
-        trim_pool(bytes);
-    }
-    #[cfg(target_arch = "wasm32")]
-    let _ = bytes;
+    ctx::POOL_LIMIT.store(bytes, Ordering::Relaxed);
+    trim_pool(bytes);
 }
 
 /// Free recycled buffers until at most `keep` bytes stay pooled (e.g. when the app goes idle).
 pub fn trim_pool(keep: u64) {
-    #[cfg(not(target_arch = "wasm32"))]
-    if let Some(g) = existing_device()
-        && let Some(_work) = exit::enter()
-    {
-        if keep == 0 {
-            render::release_shared_source();
+    if let Some(g) = existing_device() {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let Some(_work) = exit::enter() else { return };
+            if keep == 0 {
+                render::release_shared_source();
+            }
+            g.trim(keep);
         }
-        g.trim(keep);
+        #[cfg(target_arch = "wasm32")]
+        {
+            if keep == 0 {
+                render::release_shared_source();
+            }
+            g.trim(keep);
+        }
     }
-    #[cfg(target_arch = "wasm32")]
-    let _ = keep;
 }
 
 /// Device bytes of the one big source (a zoom window's original) shared by every view of the photo.
 pub fn shared_source_bytes() -> usize {
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        render::shared_source_bytes()
-    }
-    #[cfg(target_arch = "wasm32")]
-    {
-        0
-    }
+    render::shared_source_bytes()
 }
 
 /// Big sources uploaded to the shared copy so far (a diagnostic: one big photo is uploaded once, not once per window).
 pub fn source_uploads() -> u64 {
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        render::source_uploads()
-    }
-    #[cfg(target_arch = "wasm32")]
-    {
-        0
-    }
+    render::source_uploads()
 }
 
 /// Device bytes held by a view's GPU stages (kept with its [`StageCache`]); 0 when it has none.
 pub fn stage_bytes(stages: &StageCache) -> usize {
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        stages.peek_extension::<GpuStages>().map(|g| g.bytes()).unwrap_or(0)
-    }
-    #[cfg(target_arch = "wasm32")]
-    {
-        let _ = stages;
-        0
-    }
+    stages.peek_extension::<GpuStages>().map(|g| g.bytes()).unwrap_or(0)
 }
 
 /// Render `src` with `s` on the GPU, reusing the device-resident stages kept with `stages` (the
@@ -458,84 +471,77 @@ pub fn try_render(
     req: &RenderRequest,
     stages: Option<&StageCache>,
 ) -> Result<Rendered, Fallback> {
+    // sections switched off with their eye render as if at their defaults (issue #316)
+    let effective = s.effective();
+    let s: &DevelopSettings = &effective;
+    if !enabled() || !handles(req.depth, req.proof.is_some(), req.overlay) {
+        return Err(Fallback::NotTried);
+    }
+    let s = &*lightcraft_pipeline::settings_for(s, req);
+    // in flight until this returns; not tried once the process is ending (issue #620)
     #[cfg(not(target_arch = "wasm32"))]
-    {
-        // sections switched off with their eye render as if at their defaults (issue #316)
-        let effective = s.effective();
-        let s: &DevelopSettings = &effective;
-        if !enabled() || !handles(req.depth, req.proof.is_some(), req.overlay) {
-            return Err(Fallback::NotTried);
+    let _work = exit::enter().ok_or(Fallback::NotTried)?;
+    let gpu = device().ok_or(Fallback::NotTried)?;
+    let ext = stages.map(|c| c.extension::<GpuStages>());
+    let fault = take_fault();
+    // A simulated failure stops GPU use on this thread only (see `BROKEN_HERE`).
+    let stop = |reason: &str| if fault.is_some() { mark_broken_here(reason) } else { mark_broken(reason) };
+    let _ = ctx::take_failure(); // nothing left over from an earlier render on this thread
+    let (r, scoped) = {
+        let _scope = ctx::RenderScope::new(gpu);
+        let errors = ctx::ErrorScopes::push(gpu);
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| render::render(gpu, src, info, s, req, ext.as_deref(), fault)));
+        (r, errors.pop())
+    };
+    // An error the device raised explains the readback failures that follow it; a buffer
+    // over the limit explains the errors its placeholder raises.
+    let failure = match (ctx::take_failure(), scoped) {
+        (Some(f), _) if f.kind == ctx::FailKind::Limit => Some(f),
+        (f, scoped) => scoped.or(f),
+    };
+    let reason = match (r, failure) {
+        (Err(_), _) => {
+            log::error!("gpu: render failed; using the CPU pipeline from now on");
+            stop("a GPU render panicked");
+            "a GPU render panicked; the GPU is not used again".to_string()
         }
-        let s = &*lightcraft_pipeline::settings_for(s, req);
-        // in flight until this returns; not tried once the process is ending (issue #620)
-        let _work = exit::enter().ok_or(Fallback::NotTried)?;
-        let gpu = device().ok_or(Fallback::NotTried)?;
-        let ext = stages.map(|c| c.extension::<GpuStages>());
-        let fault = take_fault();
-        // A simulated failure stops GPU use on this thread only (see `BROKEN_HERE`).
-        let stop = |reason: &str| if fault.is_some() { mark_broken_here(reason) } else { mark_broken(reason) };
-        let _ = ctx::take_failure(); // nothing left over from an earlier render on this thread
-        let (r, scoped) = {
-            let _scope = ctx::RenderScope::new(gpu);
-            let errors = ctx::ErrorScopes::push(gpu);
-            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| render::render(gpu, src, info, s, req, ext.as_deref(), fault)));
-            (r, errors.pop())
-        };
-        // An error the device raised explains the readback failures that follow it; a buffer
-        // over the limit explains the errors its placeholder raises.
-        let failure = match (ctx::take_failure(), scoped) {
-            (Some(f), _) if f.kind == ctx::FailKind::Limit => Some(f),
-            (f, scoped) => scoped.or(f),
-        };
-        let reason = match (r, failure) {
-            (Err(_), _) => {
-                log::error!("gpu: render failed; using the CPU pipeline from now on");
-                stop("a GPU render panicked");
-                "a GPU render panicked; the GPU is not used again".to_string()
+        (Ok(r), Some(f)) => {
+            // the view's cached device stages may hold results of the failed passes
+            if let Some(e) = &ext {
+                e.clear();
             }
-            (Ok(r), Some(f)) => {
-                // the view's cached device stages may hold results of the failed passes
-                if let Some(e) = &ext {
-                    e.clear();
+            let what = match &r {
+                Some(r) => format!("{}×{}", r.image.width, r.image.height),
+                None => "GPU render".into(),
+            };
+            let reason = match f.kind {
+                ctx::FailKind::Fatal => {
+                    stop(&f.reason);
+                    format!("{what}: {}; the GPU is not used again", f.reason)
                 }
-                let what = match &r {
-                    Some(r) => format!("{}×{}", r.image.width, r.image.height),
-                    None => "GPU render".into(),
-                };
-                let reason = match f.kind {
-                    ctx::FailKind::Fatal => {
-                        stop(&f.reason);
-                        format!("{what}: {}; the GPU is not used again", f.reason)
-                    }
-                    ctx::FailKind::OutOfMemory => {
-                        gpu.trim(0);
-                        format!("{what}: {}", f.reason)
-                    }
-                    ctx::FailKind::Limit | ctx::FailKind::Blank => format!("{what}: {}", f.reason),
-                };
-                log::warn!("gpu: rendering on the CPU instead: {reason}");
-                if render::profiling() {
-                    eprintln!("  gpu fallback to the CPU: {reason}");
+                ctx::FailKind::OutOfMemory => {
+                    gpu.trim(0);
+                    format!("{what}: {}", f.reason)
                 }
-                reason
+                ctx::FailKind::Limit | ctx::FailKind::Blank => format!("{what}: {}", f.reason),
+            };
+            log::warn!("gpu: rendering on the CPU instead: {reason}");
+            if render::profiling() {
+                eprintln!("  gpu fallback to the CPU: {reason}");
             }
-            // a device error on another thread or a lost device during the render
-            (Ok(Some(_)), None) if BROKEN.load(Ordering::Relaxed) => {
-                format!("device failure during the render: {}", unavailable_reason().unwrap_or_default())
-            }
-            (Ok(Some(r)), None) => return Ok(r),
-            // every path of `render::render` that gives up records a failure first; should one
-            // not, the CPU renders it rather than nothing
-            (Ok(None), None) => "GPU render: no image came back".to_string(),
-        };
-        record_fallback(reason.clone());
-        Err(Fallback::Failed(reason))
-    }
-    #[cfg(target_arch = "wasm32")]
-    {
-        let _ = (src, info, s, req, stages);
-        Err(Fallback::NotTried)
-    }
+            reason
+        }
+        // a device error on another thread or a lost device during the render
+        (Ok(Some(_)), None) if BROKEN.load(Ordering::Relaxed) => {
+            format!("device failure during the render: {}", unavailable_reason().unwrap_or_default())
+        }
+        (Ok(Some(r)), None) => return Ok(r),
+        // every path of `render::render` that gives up records a failure first; should one
+        // not, the CPU renders it rather than nothing
+        (Ok(None), None) => "GPU render: no image came back".to_string(),
+    };
+    record_fallback(reason.clone());
+    Err(Fallback::Failed(reason))
 }
 
 #[cfg(test)]

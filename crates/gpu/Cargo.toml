@@ -18,12 +18,17 @@ lightcraft-faces = { workspace = true }
 lightcraft-pipeline = { workspace = true }
 log = { workspace = true }
 
-# Native only: Metal / Vulkan / DX12 through wgpu (pure Rust; the drivers are the system's).
-# The browser build keeps the CPU pipeline (WebGPU needs async device creation: see docs/gpu-pipeline.md).
+bytemuck = { workspace = true }
+
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 wgpu = { workspace = true }
 pollster = { workspace = true }
-bytemuck = { workspace = true }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wgpu = { workspace = true, features = ["fragile-send-sync-non-atomic-wasm"] }
+wasm-bindgen = { workspace = true }
+wasm-bindgen-futures = { workspace = true }
+web-sys = { workspace = true, features = ["Window", "Navigator"] }
 
 [features]
 default = []

@@ -58,6 +58,7 @@ thread_local! {
 #[wasm_bindgen]
 pub fn worker_main(store: String) {
     eframe::WebLogger::init(log::LevelFilter::Info).ok();
+    lightcraft_engine::gpu::warm_up();
     let scope: web_sys::DedicatedWorkerGlobalScope = js_sys::global().unchecked_into();
     // The main thread sends jobs only after "ready", i.e. once storage is open, and one at a time.
     wasm_bindgen_futures::spawn_local(async move {

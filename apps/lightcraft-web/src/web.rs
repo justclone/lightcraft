@@ -432,6 +432,20 @@ impl WebApp {
         }
         // previews are large (≤ 2560 px, f32): keep few in a 32-bit address space
         session.media.preview_capacity = 3;
+        if let Some(state) = &cc.wgpu_render_state {
+            if let Err(e) = lightcraft_engine::gpu::init_from_device(
+                state.device.clone(),
+                state.queue.clone(),
+                state.adapter.get_info(),
+                state.adapter.limits(),
+            ) {
+                log::warn!("lightcraft: failed to bind eframe WebGPU device: {e}");
+            } else {
+                log::info!("lightcraft: WebGPU attached from canvas context ({})", state.adapter.get_info().name);
+            }
+        } else {
+            lightcraft_engine::gpu::warm_up();
+        }
         let frozen = Rc::new(Cell::new(false));
         let mut app = LightcraftApp::new(session, services(originals.clone(), backend.clone(), files.clone(), frozen.clone(), cc.egui_ctx.clone()))
             .with_chinese_font(chinese_font);

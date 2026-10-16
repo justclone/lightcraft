@@ -193,17 +193,8 @@ impl WorkerCore {
             }
         };
         let info = src.info_or(job.info());
-        let mut rendered = match &job.stages {
-            Some(view) => {
-                let st = self.stages.entry(view.clone()).or_default().clone();
-                lightcraft_engine::pipeline::render_cached(&src.image, &info, &job.settings, &job.request(), &st)
-            }
-            None => lightcraft_engine::pipeline::render(&src.image, &info, &job.settings, &job.request()),
-        };
-        // an HDR edit's histogram shows its HDR range (as on native)
-        if let Some(h) = lightcraft_engine::pipeline::hdr_histogram(&src.image, &info, &job.settings, &job.request()) {
-            rendered.histogram = h;
-        }
+        let st = job.stages.as_ref().map(|view| self.stages.entry(view.clone()).or_default().clone());
+        let rendered = lightcraft_engine::media::develop(&src.image, &info, &job.settings, &job.request(), st.as_deref(), true);
         Ok(rendered)
     }
 }

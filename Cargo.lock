@@ -3313,6 +3313,9 @@ dependencies = [
  "lightcraft-testkit",
  "log",
  "pollster 1.0.1",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
  "wgpu",
 ]
 
